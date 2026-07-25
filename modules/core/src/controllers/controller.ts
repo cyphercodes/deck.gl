@@ -76,6 +76,8 @@ export type ControllerOptions = {
   inertia?: boolean | number;
   /** Bounding box of content that the controller is constrained in */
   maxBounds?: [min: [number, number], max: [number, number]] | [min: [number, number, number], max: [number, number, number]] | null;
+  /** Allow orthographic panning to temporarily overshoot `maxBounds`. Default `false`. */
+  rubberBand?: boolean;
 };
 
 export type ControllerProps = {
