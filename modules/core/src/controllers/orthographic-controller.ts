@@ -8,12 +8,13 @@ import ViewState from './view-state';
 
 import type Viewport from '../viewports/viewport';
 import LinearInterpolator from '../transitions/linear-interpolator';
+import type {TransitionProps} from './transition-manager';
 import type {MjolnirGestureEvent} from 'mjolnir.js';
 
 /** Marks temporary gesture and transition props without exposing them in view state. */
 const MAX_BOUNDS_RUBBER_BAND_PHASE = Symbol('maxBoundsRubberBandPhase');
-/** Minimum dominant-axis release speed required to classify a pan as a flick, in pixels/ms. */
-const MAX_BOUNDS_RUBBER_BAND_MIN_FLING_VELOCITY = 0.3;
+/** Keeps edge rebounds responsive without shortening configured fling inertia. */
+const MAX_BOUNDS_RUBBER_BAND_DURATION = 300;
 
 type MaxBoundsRubberBandPhase = {
   [MAX_BOUNDS_RUBBER_BAND_PHASE]?: 'drag' | 'transition';
@@ -23,6 +24,23 @@ type MaxBoundsRubberBandPhase = {
 class RubberBandInterpolator extends LinearInterpolator {
   constructor() {
     super(['target', 'zoomX', 'zoomY']);
+  }
+
+  /** Keeps elastic edge returns short without changing ordinary fling inertia. */
+  override getDuration(startProps: Record<string, any>, endProps: Record<string, any>): number {
+    const {maxBounds, maxBoundsRubberBand, target, width, height} = startProps;
+    if (maxBoundsRubberBand && maxBounds && target) {
+      const {zoomX, zoomY} = normalizeZoom(startProps);
+      const isOverscrolled = [width / 2 / 2 ** zoomX, height / 2 / 2 ** zoomY].some(
+        (halfSize, index) =>
+          target[index] < maxBounds[0][index] + halfSize ||
+          target[index] > maxBounds[1][index] - halfSize
+      );
+      if (isOverscrolled) {
+        return MAX_BOUNDS_RUBBER_BAND_DURATION;
+      }
+    }
+    return super.getDuration(startProps, endProps);
   }
 
   /** Allows a zero-duration gesture to interrupt an in-progress return. */
@@ -72,6 +90,8 @@ type OrthographicStateInternal = {
   startPanPosition?: number[];
   startZoomPosition?: number[];
   startZoom?: number[];
+  /** Preserves the release target before native inertia projects another pan. */
+  previousPanTarget?: number[];
 };
 
 function normalizeZoom({
@@ -128,11 +148,17 @@ export class OrthographicState extends ViewState<
       startPanPosition,
       // Model state when the zoom operation first started
       startZoomPosition,
-      startZoom
+      startZoom,
+      previousPanTarget
     } = options;
 
     const {[MAX_BOUNDS_RUBBER_BAND_PHASE]: maxBoundsRubberBandPhase} =
       options as OrthographicStateProps & MaxBoundsRubberBandPhase;
+    const {transitionDuration, transitionInterpolator, transitionEasing} =
+      options as OrthographicStateProps & TransitionProps;
+    // Let inherited, remappable actions interrupt a spring without snapping to its edge.
+    const isRubberBandTransition =
+      transitionInterpolator instanceof RubberBandInterpolator && Number(transitionDuration) > 0;
     const {zoomX, zoomY} = normalizeZoom(options);
 
     super(
@@ -150,15 +176,20 @@ export class OrthographicState extends ViewState<
         maxZoomY,
         maxBounds,
         maxBoundsRubberBand,
+        ...(transitionDuration !== undefined && {transitionDuration}),
+        ...(transitionInterpolator && {transitionInterpolator}),
+        ...(transitionEasing && {transitionEasing}),
         ...{
           [MAX_BOUNDS_RUBBER_BAND_PHASE]:
-            maxBoundsRubberBandPhase ?? (startPanPosition ? 'transition' : undefined)
+            maxBoundsRubberBandPhase ??
+            (startPanPosition || isRubberBandTransition ? 'transition' : undefined)
         }
       },
       {
         startPanPosition,
         startZoomPosition,
-        startZoom
+        startZoom,
+        previousPanTarget
       },
       options.makeViewport
     );
@@ -188,17 +219,57 @@ export class OrthographicState extends ViewState<
     const viewport = this.makeViewport(this.getViewportProps());
     const newProps = viewport.panByPosition(startPanPosition, pos);
 
-    return this._getUpdatedState(newProps);
+    return this._getUpdatedState({
+      ...newProps,
+      previousPanTarget: this.getViewportProps().target
+    });
   }
 
   /**
-   * End panning
-   * Must call if `panStart()` was called
+   * Ends a semantic pan and supplies a spring-back when it exceeds `maxBounds`.
+   * Must be called if `panStart()` was called.
    */
   panEnd(): OrthographicState {
-    return this._getUpdatedState({
-      startPanPosition: null
+    const {maxBounds, maxBoundsRubberBand, target} = this.getViewportProps();
+    const previousPanTarget = this.getState().previousPanTarget;
+    let endedState = this._getUpdatedState({
+      startPanPosition: null,
+      previousPanTarget: null
     });
+    let isOverscrolled = target.some(
+      (value, index) => value !== endedState.getViewportProps().target[index]
+    );
+
+    // Settle from the real release target, not a later inertia-projected position.
+    if (maxBoundsRubberBand && maxBounds && previousPanTarget) {
+      const previousEndedState = this._getUpdatedState({
+        target: previousPanTarget,
+        startPanPosition: null,
+        previousPanTarget: null
+      });
+      const wasOverscrolled = previousPanTarget.some(
+        (value, index) => value !== previousEndedState.getViewportProps().target[index]
+      );
+      if (wasOverscrolled) {
+        isOverscrolled = true;
+        endedState = previousEndedState;
+      }
+    }
+
+    if (maxBoundsRubberBand && maxBounds && isOverscrolled) {
+      Object.assign(endedState.getViewportProps(), {
+        transitionDuration: MAX_BOUNDS_RUBBER_BAND_DURATION,
+        transitionInterpolator: new RubberBandInterpolator(),
+        transitionEasing: (time: number) => 1 - (1 - time) * (1 - time)
+      } satisfies TransitionProps);
+    }
+
+    return endedState;
+  }
+
+  /** Includes standard transition settings produced by a semantic pan release. */
+  override getViewportProps(): Required<OrthographicStateProps> & TransitionProps {
+    return super.getViewportProps();
   }
 
   /**
@@ -392,7 +463,9 @@ export class OrthographicState extends ViewState<
       ...this.getState(),
       ...newProps,
       [MAX_BOUNDS_RUBBER_BAND_PHASE]:
-        this.getState().startPanPosition && newProps.target ? 'drag' : undefined
+        this.getState().startPanPosition && newProps.startPanPosition !== null && newProps.target
+          ? 'drag'
+          : undefined
     });
   }
 
@@ -500,71 +573,15 @@ export class OrthographicState extends ViewState<
 
 export default class OrthographicController extends Controller<OrthographicState> {
   ControllerState = OrthographicState;
-  transition = {
+  transition: {transitionDuration: number; transitionInterpolator: LinearInterpolator} = {
     transitionDuration: 300,
-    transitionInterpolator: new LinearInterpolator(['target', 'zoomX', 'zoomY'])
+    transitionInterpolator: new RubberBandInterpolator()
   };
   dragMode: 'pan' | 'rotate' = 'pan';
 
   setProps(props: ControllerProps & OrthographicStateProps) {
     Object.assign(props, normalizeZoom(props));
     super.setProps(props);
-  }
-
-  /** Preserves the current overscroll when a new gesture interrupts its return. */
-  override get controllerState(): OrthographicState {
-    return this.transitionManager.transition.inProgress &&
-      this.props.transitionInterpolator instanceof RubberBandInterpolator
-      ? new this.ControllerState({
-          makeViewport: this.makeViewport,
-          ...this.props,
-          ...this.state,
-          ...{[MAX_BOUNDS_RUBBER_BAND_PHASE]: 'transition' as const}
-        })
-      : super.controllerState;
-  }
-
-  /** Returns overscrolled gestures to the nearest valid `maxBounds` target. */
-  protected override _onPanMoveEnd(event: MjolnirGestureEvent): boolean {
-    if (!this.props.maxBoundsRubberBand || !this.props.maxBounds || !this.dragPan) {
-      return super._onPanMoveEnd(event);
-    }
-
-    const currentState = this.controllerState;
-    const constrainedState = currentState.panEnd();
-    const currentTarget = currentState.getViewportProps().target;
-    const constrainedTarget = constrainedState.getViewportProps().target;
-    const isOverscrolled = currentTarget.some((value, index) => value !== constrainedTarget[index]);
-
-    if (isOverscrolled) {
-      this.updateViewport(
-        constrainedState,
-        {
-          ...this._getTransitionProps(),
-          transitionDuration: this.transition.transitionDuration,
-          transitionEasing: time => 1 - (1 - time) * (1 - time),
-          transitionInterpolator: new RubberBandInterpolator()
-        },
-        {isDragging: false, isPanning: true}
-      );
-      return true;
-    }
-
-    const velocityX = Number.isFinite(event.velocityX) ? event.velocityX : 0;
-    const velocityY = Number.isFinite(event.velocityY) ? event.velocityY : 0;
-    const isIntentionalFling =
-      Math.max(Math.abs(velocityX), Math.abs(velocityY)) >
-      MAX_BOUNDS_RUBBER_BAND_MIN_FLING_VELOCITY;
-
-    if (!isIntentionalFling && event.velocity) {
-      this.updateViewport(constrainedState, null, {
-        isDragging: false,
-        isPanning: false
-      });
-      return true;
-    }
-
-    return super._onPanMoveEnd(event);
   }
 
   protected _onMultiPanStart(event: MjolnirGestureEvent): boolean {

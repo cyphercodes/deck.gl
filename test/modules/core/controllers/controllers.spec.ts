@@ -5,6 +5,7 @@
 import {test, expect} from 'vitest';
 import {
   type ControllerProps,
+  LinearInterpolator,
   MapView,
   OrbitView,
   OrthographicView,
@@ -384,6 +385,35 @@ function expectRubberBandInteractionEnded(interactionStates: any[]) {
   });
 }
 
+test('OrthographicState constrains and releases panning without gesture handlers', () => {
+  for (const maxBoundsRubberBand of [false, true]) {
+    const controller = createRubberBandController({controller: {maxBoundsRubberBand}});
+    const panningState = controller.controllerState.panStart({pos: [50, 50]}).pan({pos: [200, 50]});
+    const draggedTarget = panningState.getViewportProps().target;
+
+    if (maxBoundsRubberBand) {
+      expect(draggedTarget[0], 'the state permits resisted overscroll').toBeLessThan(50);
+      expect(draggedTarget[0], 'the state resists raw pan displacement').toBeGreaterThan(-50);
+    } else {
+      expect(draggedTarget, 'the state keeps default bounds hard').toEqual([50, 100]);
+    }
+
+    const releasedProps = panningState.panEnd().getViewportProps();
+    expect(releasedProps.target, 'panEnd returns to the nearest valid edge').toEqual([50, 100]);
+    if (maxBoundsRubberBand) {
+      expect(releasedProps.transitionDuration, 'panEnd owns the short spring').toBe(300);
+      expect(
+        releasedProps.transitionInterpolator,
+        'panEnd preserves native linear interpolation'
+      ).toBeInstanceOf(LinearInterpolator);
+    } else {
+      expect(releasedProps.transitionDuration ?? 0, 'hard bounds do not start a spring').toBe(0);
+    }
+    expect(Object.getOwnPropertySymbols(releasedProps), 'state metadata stays private').toEqual([]);
+    controller.finalize();
+  }
+});
+
 test('OrthographicController keeps maxBounds hard by default', () => {
   for (const maxBoundsRubberBand of [undefined, false]) {
     const controller = createRubberBandController({controller: {maxBoundsRubberBand}});
@@ -419,6 +449,32 @@ test('OrthographicController keeps non-gesture bounds hard with rubber-banding e
     'disabled panning does not start a spring-back'
   ).toBe(false);
   disabledController.finalize();
+});
+
+test('OrthographicController rubber-bands a modifier-remapped pan action', () => {
+  const interactionStates: any[] = [];
+  const controller = createRubberBandController({
+    controller: {dragMode: 'rotate'},
+    onStateChange: state => interactionStates.push({...state})
+  });
+  const makeRemappedGesture = (type: string, x: number = 50) => ({
+    ...makeGestureEvent(type, {x}),
+    srcEvent: {shiftKey: true}
+  });
+
+  expect(controller.handleEvent(makeRemappedGesture('panstart') as any)).toBe(true);
+  expect(controller.handleEvent(makeRemappedGesture('panmove', 200) as any)).toBe(true);
+  expect(controller.props.target[0], 'the remapped action exceeds the edge').toBeLessThan(50);
+  expect(controller.props.target[0], 'the remapped action is resisted').toBeGreaterThan(-50);
+  expect(controller.handleEvent(makeRemappedGesture('panend', 200) as any)).toBe(true);
+
+  const transition = controller.transitionManager.transition;
+  expect(transition.inProgress, 'the remapped action starts the state-defined return').toBe(true);
+  expect(transition.settings.duration, 'the remapped action uses the short spring').toBe(300);
+  advanceRubberBandTransition(controller, 300);
+  expect(controller.props.target, 'the remapped action settles at the edge').toEqual([50, 100]);
+  expectRubberBandInteractionEnded(interactionStates);
+  controller.finalize();
 });
 
 test('OrthographicController applies resistance beyond every edge', () => {
@@ -676,38 +732,16 @@ test('OrthographicController preserves overscroll during an inward release', () 
   controller.finalize();
 });
 
-test('OrthographicController preserves native inertia for in-bounds flings', () => {
-  const controller = createRubberBandController({controller: {inertia: 900}});
-  panRubberBand(controller, {x: 60});
-  controller.handleEvent({
-    ...makeGestureEvent('panend', {x: 60}),
-    velocity: 0.4,
-    velocityX: 0.4,
-    velocityY: 0
-  } as any);
-  const transition = controller.transitionManager.transition;
-  expect(transition.inProgress, 'the in-bounds fling starts native inertia').toBe(true);
-  expect(transition.settings.duration, 'the fling keeps its configured inertia').toBe(900);
-  expect(
-    transition.settings.interpolator.constructor.name,
-    'in-bounds flings retain the native linear interpolator'
-  ).toBe('LinearInterpolator');
-  advanceRubberBandTransition(controller, 900);
-  expect(transition.inProgress, 'the native fling finishes').toBe(false);
-  controller.finalize();
-});
-
 test.each([
   {description: 'slow horizontal velocity', velocity: 0.05, velocityX: 0.05, velocityY: 0},
   {description: 'slow diagonal velocity', velocity: 0.22, velocityX: 0.22, velocityY: 0.22},
-  {description: 'velocity at the flick threshold', velocity: 0.3, velocityX: 0.3, velocityY: 0}
+  {description: 'moderate horizontal velocity', velocity: 0.3, velocityX: 0.3, velocityY: 0},
+  {description: 'fast horizontal velocity', velocity: 0.4, velocityX: 0.4, velocityY: 0}
 ])(
-  'OrthographicController does not turn $description into an in-bounds fling',
+  'OrthographicController preserves native inertia for $description',
   ({velocity, velocityX, velocityY}) => {
     const controller = createRubberBandController({controller: {inertia: 900}});
     panRubberBand(controller, {x: 60});
-    const draggedTarget = controller.props.target.slice();
-
     controller.handleEvent({
       ...makeGestureEvent('panend', {x: 60}),
       velocity,
@@ -715,13 +749,15 @@ test.each([
       velocityY
     } as any);
 
-    expect(controller.props.target, 'the release remains at its dragged position').toEqual(
-      draggedTarget
-    );
+    const transition = controller.transitionManager.transition;
+    expect(transition.inProgress, 'the in-bounds fling starts native inertia').toBe(true);
+    expect(transition.settings.duration, 'the fling keeps its configured inertia').toBe(900);
     expect(
-      controller.transitionManager.transition.inProgress,
-      'a slow release does not start inertia'
-    ).toBe(false);
+      transition.settings.interpolator,
+      'in-bounds flings retain native linear interpolation'
+    ).toBeInstanceOf(LinearInterpolator);
+    advanceRubberBandTransition(controller, 900);
+    expect(transition.inProgress, 'the native fling finishes').toBe(false);
     controller.finalize();
   }
 );
@@ -764,9 +800,17 @@ test.each([
 
 test('OrthographicController applies rubber-band resistance to multi-touch panning', () => {
   const controller = createRubberBandController({controller: {multiTouchDrag: 'pan'}});
-  panRubberBand(controller, {x: 200, deltaX: 150}, 'multipan');
+  const position = {x: 200, deltaX: 150};
+  panRubberBand(controller, position, 'multipan');
   expect(controller.props.target[0], 'multi-touch panning overshoots the edge').toBeLessThan(50);
   expect(controller.props.target[0], 'multi-touch overscroll is resisted').toBeGreaterThan(-50);
+  expect(controller.handleEvent(makeGestureEvent('multipanend', position) as any)).toBe(true);
+
+  const transition = controller.transitionManager.transition;
+  expect(transition.inProgress, 'multi-touch panEnd starts the state-defined return').toBe(true);
+  expect(transition.settings.duration, 'multi-touch panEnd uses the short spring').toBe(300);
+  advanceRubberBandTransition(controller, 300);
+  expect(controller.props.target, 'multi-touch panEnd settles at the edge').toEqual([50, 100]);
   controller.finalize();
 });
 
